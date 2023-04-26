@@ -1,0 +1,324 @@
+---
+title: "MN Cancer Catchment Leaflet Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: scroll
+runtime: shiny
+---
+
+```{r setup, include = FALSE, echo = FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(janitor)
+library(plotly)
+library(shiny)
+library(leaflet)
+library(glue)
+library(Hmisc)
+
+library(sf)
+library(ggthemes)
+library(ggmap)
+library(osmdata)
+library(tigris)
+
+#Controlling figure output in markdown
+knitr::opts_chunk$set(
+#  fig.height =   
+  fig.width = 6,
+#  fig.asp = .5,
+  out.width = "90%",
+#  out.height = 
+ fig.align  = "center",
+  cache = FALSE,
+  eval  = TRUE,
+  echo  = FALSE,
+  warning = FALSE
+)
+
+#My Colors: https://folwell.umn.edu/color
+umn_palettes <- c("#ffde7a", "#ffb71e","#900021","#5b0013")
+maroon_gold <- c("#ffcc33", "#7a0019")
+
+#Set Theme for ggplot2
+theme_set(theme_bw() + theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom"))
+
+#Set Scientific notation output and decimal places for knitr
+options(scipen = 999)
+options(digits = 4)
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r data}
+#Read in the shape file
+mn.df <-
+  st_read("./USA_Counties/USA_Counties.shp", quiet = TRUE) %>%
+  janitor::clean_names() %>%
+  filter(state_name %in% "Minnesota") %>%
+  dplyr::select(name, fips, geometry) %>%
+  rename(county = name)
+
+mn.df$fips <- as.integer(mn.df$fips)
+
+#Read in the mn cancer data set
+incid <- read.csv("data\\mn_cancer_incidence_county_15_19.csv", header=TRUE)
+mort <- read.csv("data\\mn_cancer_mortality_county_15_19.csv", header=TRUE)
+
+# read in risk factor, econ, demo data
+rf <- read.csv("data\\mn_rf_and_screening_county_03-29-2023.csv", header=TRUE)
+demo <- read.csv("data\\mn_sociodemographics_county_03-29-2023.csv", header=TRUE)
+env <- read.csv("data\\mn_environment_county_03-29-2023.csv", header=TRUE)
+ht <- read.csv("data\\mn_housing_trans_county_03-29-2023.csv", header=TRUE)
+econ <- read.csv("data\\mn_economy_county_03-29-2023.csv", header=TRUE)
+#econ has 2 entries per county for unemployment dec 22
+  econ2 <- econ %>%
+    group_by(FIPS) %>%
+    slice(1)
+
+
+# for long file
+# rename
+#names(incid)
+# make names the same between incidence and mortality
+incid$Site <- recode(incid$Site, 
+                     "All sites" = "All Malignant Cancers")
+
+mort$Site <- recode(mort$Site, 
+                    "Colon and Rectum" = "Colorectal",
+                    "Oral Cavity and Pharynx" = "Oral and pharyngeal")
+
+incid <- incid %>%
+  rename(Incid_Rate = Rate,
+         Incid_Unstable = Unstable.Rate,
+         Incid_Count = Count,
+         Incid_LCI = Lower.CI,
+         Incid_UCI = Upper.CI) %>%
+  select(FIPS, County, Site, Sex, Incid_Rate, Incid_Unstable, Incid_Count, Incid_LCI, Incid_UCI, Pop)
+
+mort <- mort %>%
+  rename(Mort_Rate = Rate,
+         Mort_Unstable = Unstable.Rate,
+         Mort_Count = Count,
+         Mort_LCI = Lower.CI,
+         Mort_UCI = Upper.CI) %>%
+  select(FIPS, County, Site, Sex, Mort_Rate, Mort_Unstable, Mort_Count, Mort_LCI, Mort_UCI)
+
+# join all files by FIPS
+mn_data <- incid %>%
+  left_join(mort, by=c("FIPS", "County", "Site", "Sex")) %>%
+  left_join(select(rf, -c("County","State")), by='FIPS') %>%
+  left_join(select(demo, -c("County","State")), by='FIPS') %>%
+  left_join(select(econ2, -c("County","State")), by='FIPS') %>%
+  left_join(select(env, -c("County","State")), by='FIPS') %>%
+  left_join(select(ht, -c("County","State")), by="FIPS") %>%
+  left_join(select(mn.df, -c("county")), by=c("FIPS"="fips")) %>%
+  #Add a text label
+  mutate(text_label = str_c(County, 
+                            "</br>Rate: ", Incid_Rate, " ", Incid_Unstable,
+                            " (",Incid_LCI,"-",Incid_UCI,")"))
+
+# Apply a label to the data
+label(mn_data$BMI_Obese) <- "Obese (BMI over 30)"
+label(mn_data$Currently_Smoke) <- "Currently Smoke (adults)"
+label(mn_data$Met_Breast_Screen) <- "Met Breast Screening Recommendations"
+label(mn_data$Met_Cervical_Screen) <- "Had Pap Test in Last 3 Years (age 21-64)"
+label(mn_data$Met_Colon_Screen) <- "Met Colorectal Screening Recommendations"
+label(mn_data$Gini.Coefficient) <- "Income Inequality (Gini Coefficient)"
+label(mn_data$Medicaid.Enrollment) <- "Enrolled in Medicaid"
+label(mn_data$Household.Income) <- "Household Income ($)" 
+label(mn_data$Below.Poverty) <- "Living Below Poverty"
+
+```
+
+
+```{r input_choices, echo = FALSE}
+#Pull MN county names (87)
+county_choices <- mn_data %>%
+  distinct(County) %>%
+  pull()
+
+#Pull cancer types
+cancer_choices <- mn_data %>%
+  distinct(Site) %>%
+  pull()
+
+#Pull sex
+sex_choices <- mn_data %>%
+  distinct(Sex) %>%
+  pull()
+
+#risk factors
+rf_choices <- c("BMI_Obese", "Currently_Smoke", "Met_Breast_Screen","Met_Cervical_Screen","Met_Colon_Screen",
+                "Gini.Coefficient", "Medicaid.Enrollment", "Household.Income", "Below.Poverty")
+# rf_choices <- c("Obese (BMI over 30)", "Currently Smoke (adults)", "Met Breast Screening Recommendations",
+# "Had Pap Test in Last 3 Years (age 21-64)", "Met Colorectal Screening Recommendations",
+# "Income Inequality (Gini Coefficient)", "Enrolled in Medicaid", "Household Income ($)",
+# "Living Below Poverty")
+```
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+```{r ui, echo = FALSE}
+#Define a drop down menu for cancer
+selectInput(
+  inputId  = "Cancer",
+  label    = h2("Select Cancer"),
+  choices  = cancer_choices,
+  selected = cancer_choices[1] 
+)
+
+#Define a radio button for sex
+radioButtons(
+  inputId  = "Sex",
+  label    = h2("Sex"),
+  choices  = sex_choices,
+  selected = sex_choices[1] 
+)
+
+#Define a drop down menu for county
+selectInput(
+  inputId  = "County",
+  label    = h2("Select County"),
+  choices  = county_choices,
+  selected = county_choices[1] 
+)
+
+#Define a drop down menu for risk factors
+selectInput(
+  inputId  = "RF",
+  label    = h2("Select Risk Factor or Economic Factor"),
+  choices  = rf_choices,
+  selected = rf_choices[1] 
+)
+
+```
+
+```{r input_filter, echo = FALSE}
+#Filter the data based on the inputs above
+#Use reactive expression
+dataFilterCounty <- reactive({
+#Filter the original data and return as reactive output below
+mn_data %>%
+  filter(County %in% input$County,
+         Site %in% input$Cancer,
+         Sex %in% c('Female','Male')) 
+})
+
+
+dataFilterState <- reactive({
+#Filter the original data and return as reactive output below
+mn_data %>%
+  filter(Site %in% input$Cancer,
+         Sex %in% input$Sex) 
+})
+```
+
+Column {data-width=600}
+-----------------------------------------------------------------------  
+
+### Map of MN
+
+```{r leaflet, echo = FALSE}
+#Render leaflet 
+renderLeaflet({
+  
+  #Store reactive dataFilter as data frame for further use
+  mn_cancer.df <- dataFilterState() 
+  
+  #Turn the filtered nyc data into an sf object
+  mn_cancer_sf.df  <- mn_cancer.df %>%
+  st_as_sf() 
+ 
+  # calculate quantiles for incidence rate
+  quantiles <- quantile(mn_cancer_sf.df$Incid_Rate, probs = seq(0, 1, 0.25))
+
+
+  # create breaks for incidence rate
+  breaks <- c(-Inf, quantiles[2], quantiles[3], quantiles[4], Inf)
+
+  break_labels <- c(glue("{round(quantiles[1])}-{round(quantiles[2])}"),
+                    glue("{1+round(quantiles[2])}-{round(quantiles[3])}"),
+                    glue("{1+round(quantiles[3])}-{round(quantiles[4])}"),
+                    glue("{1+round(quantiles[4])}-{round(quantiles[5])}"))
+
+  # create a factor variable for incidence rate
+  mn_cancer_sf.df$Incid_Rate_cat <- cut(mn_cancer_sf.df$Incid_Rate, 
+                                      breaks = breaks, 
+                                      labels = break_labels)
+  
+  #Create pallete based on filtered data
+  colors <- colorFactor(palette = umn_palettes, 
+                        domain = mn_cancer_sf.df$Incid_Rate_cat)
+  
+  #Create the leaflet
+  mn_cancer_sf.df %>%
+    leaflet() %>%
+    addProviderTiles('Esri.WorldTopoMap') %>% 
+    addPolygons(fillColor = ~colors(Incid_Rate_cat),
+                fillOpacity = 0.6, #alpha
+                # set boundary thickness to 2
+                weight = 2, color = "black",
+                # highlight polygons on hover
+                highlight = highlightOptions(weight = 5, color = "black", bringToFront = TRUE),
+                label = ~text_label) %>%
+    addLegend(title     = "Age-adjusted rate<br>per 100,000 people",
+              position  = "bottomright",
+              colors    = umn_palettes,
+              labels    = break_labels) 
+  
+  #set zoom?
+})
+```
+
+Column {data-width=600}
+-----------------------------------------------------------------------  
+
+### `r reactive({ input[["Cancer"]]} )` rate by `r reactive({ input[["RF"]]} )` 
+
+```{r bar, echo = FALSE}
+renderPlotly({
+
+  mn_cancer2.df  <- dataFilterState()
+  
+  #Render plotly
+  mn_cancer2.df %>%
+    plot_ly(
+        x      = ~Incid_Rate,
+        y      = ~mn_cancer2.df[[input$RF]],
+        type   = "scatter",
+        mode   = "markers",
+        marker = list(color = "#7a0019"),
+        text   = ~paste("County:", County)) %>%
+  layout(showlegend = FALSE, 
+         yaxis = list(title = attr(mn_cancer2.df[[input$RF]], "label")),
+         xaxis = list(title = "Age-adjusted Incidence Rate per 100,000 people"))
+})
+```
+
+
+### Cancer rate in `r reactive({ input[["County"]]} )` by sex
+
+```{r county_sex}
+renderPlotly({
+  #Store to grab unique neighborhoos for pallete
+  mn_cancer3.df  <- dataFilterCounty()
+  
+  #Render plot
+# mn_cancer3.df %>%
+#     ggplot(aes(x=Sex, y=Incid_Rate, fill=Sex)) +
+#     geom_bar(stat="identity") +
+#     scale_fill_manual(values=umn_mg) +
+#     theme(legend.position="none") +
+#     labs(x='', y="Age-adjusted rate per 100,000 people")
+  mn_cancer3.df %>%
+    plot_ly(
+      x = ~Sex, 
+      y = ~Incid_Rate, 
+      type = "bar",
+      marker = list(color = maroon_gold)) %>%
+    layout(yaxis = list(title = "Age-adjusted Incidence Rate per 100,000 people"))
+  #no x-axis label
+})
+```
